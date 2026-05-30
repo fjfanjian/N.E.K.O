@@ -83,6 +83,90 @@ class _DummyGetRequest:
         self.headers = headers or {}
 
 
+class _FakeTranslationService:
+    async def translate_dict(self, data, target_lang, fields_to_translate=None):
+        result = dict(data)
+        for field in fields_to_translate or []:
+            value = result.get(field)
+            if isinstance(value, str) and value:
+                result[field] = f"{target_lang}:{value}"
+        return result
+
+
+@pytest.mark.unit
+def test_profile_rename_event_prompt_i18n_is_complete_and_first_person():
+    from config.prompts.prompts_memory import (
+        PROFILE_RENAME_EVENT_FIELD,
+        PROFILE_RENAME_EVENT_TEXT,
+        render_profile_rename_event_context,
+    )
+
+    expected_langs = {"zh", "zh-TW", "en", "ja", "ko", "ru", "es", "pt"}
+    assert set(PROFILE_RENAME_EVENT_FIELD) == expected_langs
+    assert set(PROFILE_RENAME_EVENT_TEXT) == expected_langs
+
+    zh_label, zh_text = render_profile_rename_event_context("zh-CN", "旧角色", "新角色")
+    assert zh_label == "我的改名记录"
+    assert "我以前的档案名" in zh_text
+    assert "旧角色" in zh_text
+    assert "新角色" in zh_text
+    assert "只代表改名前的历史称呼" not in zh_text
+
+    en_label, en_text = render_profile_rename_event_context("en", "Old", "New")
+    assert en_label == "My Profile Rename Record"
+    assert "My previous profile name" in en_text
+    assert "Old" in en_text
+    assert "New" in en_text
+    assert "historical name before the rename" not in en_text
+
+
+@pytest.mark.unit
+def test_profile_rename_event_uses_collision_safe_synthetic_key(monkeypatch):
+    monkeypatch.setattr("utils.language_utils.get_global_language_full", lambda: "zh-CN")
+    from utils.config_manager import _build_effective_character_payload
+
+    payload = {
+        "档案名": "新角色",
+        "我的改名记录": "用户自己写的字段",
+        "_reserved": {
+            "ai_context": {
+                "rename_events": [
+                    {
+                        "type": "profile_rename",
+                        "old_name": "旧角色",
+                        "new_name": "临时角色",
+                    },
+                    {
+                        "type": "profile_rename",
+                        "old_name": "临时角色",
+                        "new_name": "新角色",
+                    }
+                ]
+            }
+        },
+    }
+    effective = _build_effective_character_payload(payload)
+
+    assert effective["我的改名记录"] == "用户自己写的字段"
+    hidden_context = effective["__ai_context.profile_rename_events"]
+    assert "我的改名记录" in hidden_context
+    assert "我以前的档案名" in hidden_context
+    assert "旧角色" in hidden_context
+    assert "临时角色" in hidden_context
+    assert "新角色" in hidden_context
+    assert hidden_context.count("我的改名记录") == 1
+
+    payload["__ai_context.profile_rename_events"] = "用户内部命名字段"
+    effective_with_internal_collision = _build_effective_character_payload(payload)
+    assert effective_with_internal_collision["__ai_context.profile_rename_events"] == "用户内部命名字段"
+    collision_values = [
+        value
+        for key, value in effective_with_internal_collision.items()
+        if key.startswith("__ai_context.profile_rename_events.")
+    ]
+    assert any("我以前的档案名" in str(value) for value in collision_values)
+
+
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_character_management_and_recent_save_regression():
@@ -210,7 +294,62 @@ async def test_character_read_endpoints_disable_caching():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_rename_catgirl_moves_runtime_and_legacy_memory_storage():
+async def test_get_characters_preserves_profile_names_when_translating_display_fields():
+    with TemporaryDirectory() as td:
+        cm = _make_config_manager(Path(td))
+        bootstrap_local_cloudsave_environment(cm)
+        characters = cm.load_characters()
+        characters["主人"] = {"档案名": "主人原名", "昵称": "主人昵称"}
+        characters["猫娘"] = {
+            "猫娘原名": {
+                "档案名": "猫娘原名",
+                "昵称": "猫娘昵称",
+                "性别": "女",
+            }
+        }
+        characters["当前猫娘"] = "猫娘原名"
+        cm.save_characters(characters)
+
+        async def _noop_init():
+            return None
+
+        async def _noop_any(*args, **kwargs):
+            return None
+
+        with patch("utils.config_manager._config_manager", cm), patch(
+            "utils.language_utils.get_translation_service",
+            return_value=_FakeTranslationService(),
+        ):
+            init_shared_state(
+                role_state={},
+                steamworks=None,
+                templates=None,
+                config_manager=cm,
+                logger=None,
+                initialize_character_data=_noop_init,
+                switch_current_catgirl_fast=_noop_any,
+                init_one_catgirl=_noop_any,
+                remove_one_catgirl=_noop_any,
+            )
+
+            characters_router_module = reload_module("main_routers.characters_router")
+            response = await characters_router_module.get_characters(
+                _DummyGetRequest(headers={"Accept-Language": "en-US"})
+            )
+            payload = json.loads(response.body.decode("utf-8"))
+
+            assert payload["主人"]["档案名"] == "主人原名"
+            assert payload["主人"]["昵称"] == "en:主人昵称"
+            assert "猫娘原名" in payload["猫娘"]
+            assert payload["猫娘"]["猫娘原名"]["档案名"] == "猫娘原名"
+            assert payload["猫娘"]["猫娘原名"]["昵称"] == "en:猫娘昵称"
+            assert payload["猫娘"]["猫娘原名"]["性别"] == "en:女"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rename_catgirl_moves_runtime_and_legacy_memory_storage(monkeypatch):
+    monkeypatch.setattr("utils.language_utils.get_global_language_full", lambda: "zh-CN")
     with TemporaryDirectory() as td:
         cm = _make_config_manager(Path(td))
         bootstrap_local_cloudsave_environment(cm)
@@ -284,8 +423,29 @@ async def test_rename_catgirl_moves_runtime_and_legacy_memory_storage():
 
             assert rename_result["success"] is True
             assert rename_result["memory_renamed"] is True
-            assert "新角色" in cm.load_characters().get("猫娘", {})
-            assert "旧角色" not in cm.load_characters().get("猫娘", {})
+            saved_characters = cm.load_characters()
+            assert "新角色" in saved_characters.get("猫娘", {})
+            assert "旧角色" not in saved_characters.get("猫娘", {})
+            saved_profile = saved_characters["猫娘"]["新角色"]
+            assert "我的改名记录" not in saved_profile
+            rename_events = saved_profile["_reserved"]["ai_context"]["rename_events"]
+            assert rename_events[-1]["old_name"] == "旧角色"
+            assert rename_events[-1]["new_name"] == "新角色"
+            assert "text" not in rename_events[-1]
+
+            _, _, _, effective_character_data, _, _, _, _, _ = cm.get_character_data()
+            hidden_context = effective_character_data["新角色"]["__ai_context.profile_rename_events"]
+            assert "我的改名记录" in hidden_context
+            assert "我以前的档案名" in hidden_context
+            assert "旧角色" in hidden_context
+            assert "新角色" in hidden_context
+            from memory.persona import PersonaManager
+            persona_md = PersonaManager().render_persona_markdown("新角色")
+            assert "__ai_context.profile_rename_events" in persona_md
+            assert "我的改名记录" in persona_md
+            assert "我以前的档案名" in persona_md
+            assert "旧角色" in persona_md
+            assert "新角色" in persona_md
             assert not (Path(cm.memory_dir) / "旧角色").exists()
             assert (Path(cm.memory_dir) / "新角色" / "persona.json").is_file()
             assert (Path(cm.memory_dir) / "新角色" / "facts.json").is_file()
@@ -301,6 +461,183 @@ async def test_rename_catgirl_moves_runtime_and_legacy_memory_storage():
             )
             assert memory_rename_result["success"] is True
             assert (Path(cm.memory_dir) / "新角色" / "recent.json").is_file()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rename_master_adds_hidden_ai_context_and_master_save_preserves_it(monkeypatch):
+    monkeypatch.setattr("utils.language_utils.get_global_language_full", lambda: "zh-CN")
+    with TemporaryDirectory() as td:
+        cm = _make_config_manager(Path(td))
+        bootstrap_local_cloudsave_environment(cm)
+
+        async def _noop_init():
+            return None
+
+        async def _noop_any(*args, **kwargs):
+            return None
+
+        with patch("utils.config_manager._config_manager", cm):
+            init_shared_state(
+                role_state={},
+                steamworks=None,
+                templates=None,
+                config_manager=cm,
+                logger=None,
+                initialize_character_data=_noop_init,
+                switch_current_catgirl_fast=_noop_any,
+                init_one_catgirl=_noop_any,
+                remove_one_catgirl=_noop_any,
+            )
+
+            characters_router_module = reload_module("main_routers.characters_router")
+            old_master_name = cm.load_characters()["主人"]["档案名"]
+            current_catgirl = cm.load_characters()["当前猫娘"]
+
+            rename_result = await characters_router_module.rename_master(
+                old_master_name,
+                _DummyRequest({"new_name": "新主人"}),
+            )
+
+            assert rename_result["success"] is True
+            saved_master = cm.load_characters()["主人"]
+            assert "我的改名记录" not in saved_master
+            rename_events = saved_master["_reserved"]["ai_context"]["rename_events"]
+            assert rename_events[-1]["old_name"] == old_master_name
+            assert rename_events[-1]["new_name"] == "新主人"
+            assert "text" not in rename_events[-1]
+
+            _, _, master_basic_config, _, _, _, _, _, _ = cm.get_character_data()
+            hidden_context = master_basic_config["__ai_context.profile_rename_events"]
+            assert "我的改名记录" in hidden_context
+            assert "我以前的档案名" in hidden_context
+            assert old_master_name in hidden_context
+            assert "新主人" in hidden_context
+
+            from memory.persona import PersonaManager
+            persona_md = PersonaManager().render_persona_markdown(current_catgirl)
+            assert "__ai_context.profile_rename_events" in persona_md
+            assert "我的改名记录" in persona_md
+            assert old_master_name in persona_md
+            assert "新主人" in persona_md
+
+            update_result = await characters_router_module.update_master(
+                _DummyRequest({"档案名": "新主人", "昵称": "柚希"})
+            )
+            assert update_result["success"] is True
+            saved_after_update = cm.load_characters()["主人"]
+            assert saved_after_update["档案名"] == "新主人"
+            assert saved_after_update["_reserved"]["ai_context"]["rename_events"][-1]["new_name"] == "新主人"
+            initial_count = len(saved_after_update["_reserved"]["ai_context"]["rename_events"])
+
+            bypass_result = await characters_router_module.update_master(
+                _DummyRequest({"档案名": "绕过改名", "昵称": "柚希"})
+            )
+            assert bypass_result["success"] is True
+            saved_after_bypass = cm.load_characters()["主人"]
+            assert saved_after_bypass["档案名"] == "新主人"
+            assert saved_after_bypass["_reserved"]["ai_context"]["rename_events"][-1]["new_name"] == "新主人"
+            assert len(saved_after_bypass["_reserved"]["ai_context"]["rename_events"]) == initial_count
+
+            same_name_result = await characters_router_module.rename_master(
+                "新主人",
+                _DummyRequest({"new_name": "新主人"}),
+            )
+            assert same_name_result["success"] is True
+            saved_after_same_name = cm.load_characters()["主人"]
+            assert len(saved_after_same_name["_reserved"]["ai_context"]["rename_events"]) == initial_count
+
+            legacy_conflict_characters = cm.load_characters()
+            legacy_conflict_characters.setdefault("猫娘", {})["新主人"] = {"档案名": "新主人"}
+            cm.save_characters(legacy_conflict_characters)
+            legacy_conflict_update = await characters_router_module.update_master(
+                _DummyRequest({"昵称": "柚希2"})
+            )
+            assert legacy_conflict_update["success"] is True
+            assert cm.load_characters()["主人"]["档案名"] == "新主人"
+            empty_update = await characters_router_module.update_master(_DummyRequest({}))
+            assert empty_update["success"] is True
+            saved_after_empty_update = cm.load_characters()["主人"]
+            assert saved_after_empty_update["档案名"] == "新主人"
+            assert "昵称" not in saved_after_empty_update
+            assert len(saved_after_empty_update["_reserved"]["ai_context"]["rename_events"]) == initial_count
+
+            rename_conflict_characters = cm.load_characters()
+            rename_conflict_characters.setdefault("猫娘", {})["主人同名猫娘"] = {"档案名": "主人同名猫娘"}
+            cm.save_characters(rename_conflict_characters)
+            cross_namespace_rename = await characters_router_module.rename_master(
+                "新主人",
+                _DummyRequest({"new_name": "主人同名猫娘"}),
+            )
+            assert cross_namespace_rename["success"] is True
+            saved_after_cross_namespace_rename = cm.load_characters()["主人"]
+            assert saved_after_cross_namespace_rename["档案名"] == "主人同名猫娘"
+            assert saved_after_cross_namespace_rename["_reserved"]["ai_context"]["rename_events"][-1]["new_name"] == "主人同名猫娘"
+
+            conflict_characters = cm.load_characters()
+            conflict_characters["主人"] = {}
+            conflict_characters.setdefault("猫娘", {})["占用名"] = {"档案名": "占用名"}
+            cm.save_characters(conflict_characters)
+            conflict_result = await characters_router_module.update_master(
+                _DummyRequest({"档案名": "占用名", "昵称": "柚希"})
+            )
+            assert conflict_result["success"] is True
+            assert cm.load_characters()["主人"]["档案名"] == "占用名"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_update_master_body_rename_fallback_repairs_legacy_path_name(monkeypatch):
+    monkeypatch.setattr("utils.language_utils.get_global_language_full", lambda: "zh-CN")
+    with TemporaryDirectory() as td:
+        cm = _make_config_manager(Path(td))
+        bootstrap_local_cloudsave_environment(cm)
+
+        async def _noop_init():
+            return None
+
+        async def _noop_any(*args, **kwargs):
+            return None
+
+        with patch("utils.config_manager._config_manager", cm):
+            init_shared_state(
+                role_state={},
+                steamworks=None,
+                templates=None,
+                config_manager=cm,
+                logger=None,
+                initialize_character_data=_noop_init,
+                switch_current_catgirl_fast=_noop_any,
+                init_one_catgirl=_noop_any,
+                remove_one_catgirl=_noop_any,
+            )
+
+            characters_router_module = reload_module("main_routers.characters_router")
+            legacy_characters = cm.load_characters()
+            legacy_characters["主人"]["档案名"] = "旧/主人"
+            legacy_characters["主人"]["昵称"] = "旧昵称"
+            cm.save_characters(legacy_characters)
+
+            repair_result = await characters_router_module.update_master(
+                _DummyRequest({"档案名": "修复主人", "昵称": "柚希"})
+            )
+            assert repair_result["success"] is True
+            saved_after_repair = cm.load_characters()["主人"]
+            assert saved_after_repair["档案名"] == "修复主人"
+            assert saved_after_repair["昵称"] == "柚希"
+            rename_events = saved_after_repair["_reserved"]["ai_context"]["rename_events"]
+            assert rename_events[-1]["old_name"] == "旧/主人"
+            assert rename_events[-1]["new_name"] == "修复主人"
+            initial_count = len(rename_events)
+
+            bypass_result = await characters_router_module.update_master(
+                _DummyRequest({"档案名": "再次绕过", "昵称": "柚希2"})
+            )
+            assert bypass_result["success"] is True
+            saved_after_bypass = cm.load_characters()["主人"]
+            assert saved_after_bypass["档案名"] == "修复主人"
+            assert saved_after_bypass["昵称"] == "柚希2"
+            assert len(saved_after_bypass["_reserved"]["ai_context"]["rename_events"]) == initial_count
 
 
 @pytest.mark.unit
