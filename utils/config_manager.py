@@ -3136,6 +3136,32 @@ class ConfigManager:
             return True
         return False
 
+    def _is_selected_hosted_preset_voice(self, voice_id):
+        """Whether voice_id is a built-in (preset) voice of the currently selected
+        TTS provider in tts_provider_registry (e.g. MiMo, a hosted SaaS).
+
+        Dual to :func:`is_saveable_native_voice` but for the unified provider
+        registry: a hosted/local provider's presets are only saveable while that
+        provider is the one dispatch would route to, so this gates on the same
+        selection the dispatcher uses.
+
+        The hosted providers are registered as a side effect of importing
+        ``main_logic.tts_client``. config_manager (utils layer) must NOT import it
+        — that's a CI-enforced layer inversion (utils → main_logic). We rely on the
+        running app having imported tts_client at startup (the TTS pipeline does),
+        so the registry is populated by the time any voice is validated; if it
+        isn't (or the lookup errors), this degrades to "not a preset voice" rather
+        than breaking validation.
+        """
+        try:
+            from utils import tts_provider_registry
+            return tts_provider_registry.is_selected_preset_voice(
+                self.get_core_config() or {}, self, voice_id
+            )
+        except Exception:
+            logger.warning("hosted preset voice 校验异常，按非预制处理", exc_info=True)
+            return False
+
     def validate_voice_id(self, voice_id):
         """Validate whether voice_id is valid under the current AUDIO_API_KEY.
         
@@ -3170,6 +3196,11 @@ class ConfigManager:
         if is_saveable_native_voice(self, voice_id):
             return True
 
+        # hosted/local provider 的内置预制音色（如选中 MiMo 时的预制声线），由
+        # tts_provider_registry 收口，仅在该 provider 被选中时算合法
+        if self._is_selected_hosted_preset_voice(voice_id):
+            return True
+
         # 免费预设音色允许豁免保存校验，运行时再由 core.py 按当前线路动态判断可用性
         from utils.api_config_loader import get_free_voices
         free_voices = get_free_voices()
@@ -3197,6 +3228,9 @@ class ConfigManager:
             return True
 
         if is_saveable_native_voice(self, voice_id):
+            return True
+
+        if self._is_selected_hosted_preset_voice(voice_id):
             return True
 
         from utils.api_config_loader import get_free_voices

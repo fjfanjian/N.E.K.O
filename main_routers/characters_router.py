@@ -100,6 +100,7 @@ from utils.native_voice_registry import (
     normalize_native_voice,
     resolve_native_voice_for_routing,
 )
+from utils import tts_provider_registry
 from utils.audio import normalize_voice_clone_api_audio, validate_audio_file
 from utils.character_name import PROFILE_NAME_MAX_UNITS, validate_character_name
 from utils.initial_personality_state import (
@@ -777,6 +778,27 @@ def _get_active_native_preview_provider(config_manager, voice_id: object) -> str
     if uses_provider_native_voice:
         return active_provider
     return None
+
+
+def _is_unpreviewable_selected_preset_voice(config_manager, core_config, voice_id, voice_data) -> bool:
+    """Whether voice_id is a built-in preset of the currently selected hosted/local
+    provider (e.g. MiMo) that has no dedicated preview path yet — and is NOT a user clone.
+
+    A cloned voice whose id collides with a preset name must still preview through its
+    clone path: runtime dispatch selects clone providers (priority 30/40/50) ahead of a
+    static-catalog provider like MiMo (60), so the clone wins. Any id present in a voice
+    storage bucket is therefore never treated as an unpreviewable preset (dual to the
+    native-preview collision guard, which passes voice_id_exists_in_any_storage)."""
+    if voice_data:
+        return False
+    try:
+        if config_manager.voice_id_exists_in_any_storage(voice_id):
+            return False
+    except Exception:
+        # 存储桶查询异常（极少见的 IO 错误）：按「无法确认是克隆」继续走下方预制判定，
+        # 不因一次查询失败改变结论；留一条带堆栈的 debug 便于排查（同 _grok 撞名查模式）。
+        logger.debug("voice_id_exists_in_any_storage 查询失败，按非克隆继续判定", exc_info=True)
+    return tts_provider_registry.is_selected_preset_voice(core_config or {}, config_manager, voice_id)
 
 
 def _read_wav_payload(audio_bytes: bytes) -> tuple[bytes, int, int, int]:
@@ -4211,8 +4233,35 @@ async def get_voices():
     result = {"voices": _config_manager.get_voices_for_current_api(for_listing=True)}
 
     core_config = await _config_manager.aget_core_config()
-    active_native_provider = get_active_realtime_native_provider_for_ui(_config_manager)
-    if active_native_provider:
+    # 先看有没有自带静态预制目录的 provider 被选中（如 MiMo，hosted）。与 dispatch
+    # 同一优先级判定：选中的 provider 若有 preset_catalog 就用它，并压过 core-native
+    # （assistApi=mimo 在 dispatch 里 priority 60 也先于 native 命中）；GPT-SoVITS /
+    # vLLM 这类先命中、无静态目录的 provider 则不出目录（preset 为 None）。复用
+    # native_voices 通道——前端 source-first 选声器按 entry 的 provider/provider_label
+    # 自动分组成「<Provider> · 预制」，无需新增来源通道。
+    # 选声目录与 dispatch 同一优先级：先看哪个注册表 provider 赢得当前配置。
+    #  - 赢家有静态预制目录（如 MiMo）→ 出该目录，压过 core-native（用 is not None，
+    #    空目录也算命中，不误回退）。
+    #  - 赢家无静态目录（vLLM-Omni / GPT-SoVITS，用户自填/自部署音色）→ 既不出目录、
+    #    也不回退 core-native：dispatch 会路由到该赢家，露出 gemini 等原生音色会让用户
+    #    选中后被误传给赢家触发 unsupported-voice（PR #1848 Codex review）。
+    #  - 无注册表 provider 赢 → 回退 core-native（gemini/step/...）。
+    # 复用 native_voices 通道——前端 source-first 选声器按 entry 的 provider/provider_label
+    # 自动分组成「<Provider> · 预制」，无需新增来源通道。
+    winning_provider_key = tts_provider_registry.selected_provider_key(
+        core_config or {}, _config_manager
+    )
+    selected_preset_catalog = (
+        tts_provider_registry.preset_catalog_for_ui(winning_provider_key)
+        if winning_provider_key else None
+    )
+    active_native_provider = (
+        get_active_realtime_native_provider_for_ui(_config_manager)
+        if winning_provider_key is None else None
+    )
+    if selected_preset_catalog is not None:
+        result["native_voices"] = selected_preset_catalog
+    elif active_native_provider:
         native_catalog = get_native_voice_catalog_for_ui(active_native_provider) or {}
         if active_native_provider == 'free_intl':
             # 海外免费（lanlan.app/Gemini）：yui + default(=Leda) 两个置顶 pin，
@@ -4320,6 +4369,21 @@ async def get_voice_preview(
 
         preview_language = _get_voice_preview_language(request, language, i18n_language)
         text = _loc(VOICE_PREVIEW_TEXTS, preview_language)
+
+        # hosted/local provider 的预制音色（如选中 MiMo 时的预制声线）经 native_voices
+        # 通道露给前端会渲染试听按钮，但其试听需走该 provider 自己的合成路径（尚未接）。
+        # 在此显式拦下返回「暂不支持试听」，避免落到下方 DashScope/CosyVoice 通用分支拿着
+        # 该 provider 的 key/voice_id 误合成（PR #1848 Codex review；真试听留作后续）。
+        # 与预制同名的克隆音色不拦（dispatch 克隆 provider 先于 MiMo 命中），仍走克隆试听。
+        preview_core_config = await _config_manager.aget_core_config()
+        if _is_unpreviewable_selected_preset_voice(
+            _config_manager, preview_core_config, voice_id, voice_data
+        ):
+            return JSONResponse({
+                'success': False,
+                'error': f'当前预制音色暂不支持试听: {voice_id}',
+                'code': 'PRESET_VOICE_PREVIEW_UNSUPPORTED',
+            }, status_code=400)
 
         native_preview_provider = _get_active_native_preview_provider(_config_manager, voice_id)
         if native_preview_provider:
