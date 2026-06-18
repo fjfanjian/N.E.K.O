@@ -22,8 +22,6 @@
 
 :newspaper: **[Steam 版](https://store.steampowered.com/app/4099310/__NEKO/)已免费上架！喜欢的话，欢迎喜加一，顺手给个好评~**
 
-*Project N.E.K.O.，喵宇宙！*
-
 </div>
 
 ---
