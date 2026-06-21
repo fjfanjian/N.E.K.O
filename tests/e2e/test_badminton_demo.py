@@ -31,7 +31,13 @@ def _install_badminton_test_hooks(page: Page) -> None:
     )
 
 
-def _goto_badminton(page: Page, running_server: str, mode: str) -> None:
+def _goto_badminton(
+    page: Page,
+    running_server: str,
+    mode: str,
+    debug: bool = True,
+    wait_loading: bool = True,
+) -> None:
     _install_badminton_test_hooks(page)
     lanlan_name = "e2e-yui"
     session_id = f"e2e-badminton-{mode}"
@@ -40,12 +46,15 @@ def _goto_badminton(page: Page, running_server: str, mode: str) -> None:
     state["responded_at"] = time.time()
     state["pending_session_id"] = session_id
     state["last_game_type"] = "badminton"
+    debug_query = "&debug=1" if debug else ""
     page.goto(
         f"{running_server}/badminton_demo"
-        f"?mode={mode}&lanlan_name={lanlan_name}&session_id={session_id}&debug=1"
+        f"?mode={mode}&lanlan_name={lanlan_name}&session_id={session_id}{debug_query}"
     )
     expect(page.locator("#game")).to_be_attached(timeout=15000)
     page.wait_for_function("window.BadmintonDemo && window.BadmintonDemo.getState")
+    if not wait_loading:
+        return
     page.wait_for_function(
         """() => {
           const loading = document.getElementById('badminton-loading');
@@ -572,8 +581,11 @@ def test_badminton_yui_awaiting_return_still_hits_midcourt_net(mock_page: Page, 
           window.__bdYuiAwaitingNetSample = {
             hitNet: state.currentShuttle.hitNet,
             crossedNet: state.currentShuttle.crossedNet,
+            receivingReturn: state.receivingReturn,
             incomingReturnInReach: state.incomingReturnInReach,
+            canControlShot: state.canControlShot,
             attemptsResultsLength: state.attemptsResults.length,
+            netEffect: window.__badmintonNetEffectDebug || null,
             vx: state.currentShuttle.vx,
             vy: state.currentShuttle.vy
           };
@@ -584,8 +596,13 @@ def test_badminton_yui_awaiting_return_still_hits_midcourt_net(mock_page: Page, 
     netted = page.evaluate("window.__bdYuiAwaitingNetSample")
     assert netted["hitNet"] is True
     assert netted["crossedNet"] is True
+    assert netted["receivingReturn"] is True
     assert netted["incomingReturnInReach"] is False
+    assert netted["canControlShot"] is False
     assert netted["attemptsResultsLength"] == 0
+    assert netted["netEffect"] is not None
+    assert netted["netEffect"]["count"] >= 1
+    assert netted["netEffect"]["strength"] > 0
     assert abs(netted["vx"]) < 360
     assert netted["vy"] > 0
 
@@ -604,7 +621,67 @@ def test_badminton_yui_awaiting_return_still_hits_midcourt_net(mock_page: Page, 
     )
     resolved = page.evaluate("window.BadmintonDemo.getState()")
     assert resolved["attemptsResults"][-1]["shooter"] == "neko"
-    assert resolved["attemptsResults"][-1]["shot_type"] in ("net_touch", "net", "out")
+    assert resolved["attemptsResults"][-1]["shot_type"] == "net"
+    assert resolved["attemptsResults"][-1]["point_winner"] == "player"
+    assert resolved["duel"]["player_score"] == 1
+    assert resolved["duel"]["neko_score"] == 0
+    assert resolved["duel"]["neko_misses"] == 1
+    assert resolved["duel"]["player_misses"] == 0
+
+    page.evaluate("window.BadmintonDemo.resetGame()")
+    page.wait_for_function(
+        """() => {
+          return window.__badmintonNetEffectDebug
+            && window.__badmintonNetEffectDebug.count === 0;
+        }"""
+    )
+
+
+@pytest.mark.e2e
+def test_badminton_net_effect_debug_global_stays_debug_only(mock_page: Page, running_server: str):
+    page = mock_page
+    _goto_badminton(page, running_server, "duel", debug=False, wait_loading=False)
+
+    page.wait_for_function("window.BadmintonDemo.getState().state === 'ready'")
+    page.evaluate(
+        """() => {
+          window.BadmintonDemo._debugSetAwaitingPlayerReturnBall({
+            id: 904,
+            x: 466,
+            y: 330,
+            prevX: 470,
+            prevY: 330,
+            courtY: 466,
+            prevCourtY: 470,
+            z: 120,
+            prevZ: 120,
+            vx: -360,
+            vy: 0,
+            vCourtY: -360,
+            vz: 0,
+            radius: 18,
+            shooter: 'neko',
+            direction: -1,
+            crossedNet: false,
+            resolved: false,
+            awaitingReturnBy: 'player',
+            returnDeadlineAt: performance.now() + 2400,
+            groundedReturnAt: 0,
+            angle: 43,
+            power: 52,
+            trail: []
+          });
+        }"""
+    )
+
+    page.wait_for_function(
+        """() => {
+          const state = window.BadmintonDemo && window.BadmintonDemo.getState();
+          return state && state.currentShuttle && state.currentShuttle.hitNet;
+        }""",
+        timeout=2000,
+    )
+    assert page.evaluate("typeof window.__badmintonNetEffectDebug") == "undefined"
 
 
 @pytest.mark.e2e
@@ -734,6 +811,63 @@ def test_badminton_player_return_requires_shuttle_to_enter_character_reach(mock_
 
 
 @pytest.mark.e2e
+def test_badminton_player_return_hit_cue_only_draws_inside_reach(mock_page: Page, running_server: str):
+    page = mock_page
+    _goto_badminton(page, running_server, "duel")
+
+    count_cue_pixels = """
+      () => {
+        const canvas = document.getElementById('aiming-canvas');
+        if (!canvas) return 0;
+        const ctx = canvas.getContext('2d');
+        const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+        let lit = 0;
+        for (let i = 3; i < data.length; i += 4) {
+          if (data[i] > 20) lit++;
+        }
+        return lit;
+      }
+    """
+
+    page.wait_for_function("window.BadmintonDemo.getState().state === 'ready'")
+    page.evaluate(
+        """() => {
+          const state = window.BadmintonDemo.getState();
+          const contact = state.playerRacketContact || { x: state.playerCourt.x + 42, y: state.playerCourt.y - 76 };
+          window.BadmintonDemo._debugSetAwaitingPlayerReturnBall({
+            x: contact.x + 180,
+            y: contact.y - 180,
+            prevX: contact.x + 184,
+            prevY: contact.y - 180,
+            vx: 0,
+            vy: 0,
+            returnDeadlineAt: performance.now() + 5000
+          });
+        }"""
+    )
+    page.wait_for_timeout(80)
+    assert page.evaluate(count_cue_pixels) == 0
+
+    page.evaluate(
+        """() => {
+          const state = window.BadmintonDemo.getState();
+          const contact = state.playerRacketContact || { x: state.playerCourt.x + 42, y: state.playerCourt.y - 76 };
+          window.BadmintonDemo._debugSetAwaitingPlayerReturnBall({
+            x: contact.x,
+            y: contact.y,
+            prevX: contact.x + 4,
+            prevY: contact.y,
+            vx: -360,
+            vy: -80,
+            returnDeadlineAt: performance.now() + 5000
+          });
+        }"""
+    )
+    page.wait_for_function(f"({count_cue_pixels})() > 12", timeout=2000)
+    assert page.evaluate("window.BadmintonDemo.getState().incomingReturnInReach") is True
+
+
+@pytest.mark.e2e
 def test_badminton_vrm_overlay_does_not_block_player_swing(mock_page: Page, running_server: str):
     page = mock_page
     _goto_badminton(page, running_server, "duel")
@@ -758,7 +892,7 @@ def test_badminton_vrm_overlay_does_not_block_player_swing(mock_page: Page, runn
 
 
 @pytest.mark.e2e
-def test_badminton_allows_player_movement_but_blocks_shot_during_yui_turn(mock_page: Page, running_server: str):
+def test_badminton_allows_player_movement_and_jump_but_blocks_shot_during_yui_turn(mock_page: Page, running_server: str):
     page = mock_page
     _goto_badminton(page, running_server, "duel")
 
@@ -774,6 +908,25 @@ def test_badminton_allows_player_movement_but_blocks_shot_during_yui_turn(mock_p
 
     viewport = page.viewport_size or {"width": 1280, "height": 720}
     page.mouse.move(viewport["width"] - 8, 12)
+    page.evaluate(
+        """() => {
+          window.dispatchEvent(new KeyboardEvent('keydown', {
+            key: ' ',
+            code: 'Space',
+            bubbles: true,
+            cancelable: true
+          }));
+        }"""
+    )
+    page.wait_for_function(
+        """() => {
+          const state = window.BadmintonDemo && window.BadmintonDemo.getState();
+          if (!state || !state.playerJump || !state.playerJump.active || state.playerJump.offset <= 0) return false;
+          window.__bdYuiTurnJumpSnapshot = state.playerJump;
+          return true;
+        }""",
+        timeout=2000,
+    )
     page.mouse.down()
     page.mouse.up()
     page.evaluate("window.BadmintonDemo.shoot()")
@@ -788,6 +941,9 @@ def test_badminton_allows_player_movement_but_blocks_shot_during_yui_turn(mock_p
     )
 
     state = page.evaluate("window.BadmintonDemo.getState()")
+    jump = page.evaluate("window.__bdYuiTurnJumpSnapshot")
+    assert jump["active"] is True
+    assert jump["offset"] > 0
     assert state["playerCourt"]["targetX"] > before_move["targetX"]
     assert state["playerCourt"]["x"] > before_move["x"]
     assert state["charging"] is False
