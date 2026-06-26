@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { dirname, resolve } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 import App, {
   COMPACT_EXPORT_HISTORY_VISIBILITY_ANIMATION_MS,
   COMPACT_TOOL_WHEEL_DETENT_SOUND_SRCS,
@@ -33,6 +35,30 @@ describe('App', () => {
     COMPACT_INPUT_TOOL_WHEEL_INDEX_STORAGE_KEY,
     ACTIVE_AVATAR_TOOLS_STORAGE_KEY,
   ];
+
+  const readCompactChatStylesForTest = () => {
+    let currentDir = process.cwd();
+
+    for (let depth = 0; depth < 8; depth += 1) {
+      const packageRootCandidate = resolve(currentDir, 'src/styles.css');
+      if (existsSync(packageRootCandidate)) {
+        return readFileSync(packageRootCandidate, 'utf8');
+      }
+
+      const repoRootCandidate = resolve(currentDir, 'frontend/react-neko-chat/src/styles.css');
+      if (existsSync(repoRootCandidate)) {
+        return readFileSync(repoRootCandidate, 'utf8');
+      }
+
+      const parentDir = dirname(currentDir);
+      if (parentDir === currentDir) {
+        break;
+      }
+      currentDir = parentDir;
+    }
+
+    throw new Error(`Could not locate react-neko-chat styles.css from ${process.cwd()}`);
+  };
 
   beforeEach(() => {
     LOCAL_STORAGE_KEYS_TO_RESET.forEach(key => {
@@ -147,6 +173,44 @@ describe('App', () => {
       removeEventListener: vi.fn(),
       dispatchEvent: vi.fn(),
     }));
+  };
+
+  type DesktopCompactLayoutForTest = {
+    windowBounds: { x: number; y: number; width: number; height: number };
+    workArea: { x: number; y: number; width: number; height: number };
+  };
+
+  const installDesktopCompactLayout = (
+    layout: DesktopCompactLayoutForTest,
+    viewport: { width: number; height: number },
+  ) => {
+    const originalMatchMedia = window.matchMedia;
+    const originalInnerWidth = window.innerWidth;
+    const originalInnerHeight = window.innerHeight;
+    const desktopWindow = window as typeof window & {
+      __nekoDesktopCompactLayout?: DesktopCompactLayoutForTest | null;
+    };
+    const originalDesktopLayout = desktopWindow.__nekoDesktopCompactLayout;
+
+    mockMobileMatchMedia(false);
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: viewport.width });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: viewport.height });
+    desktopWindow.__nekoDesktopCompactLayout = layout;
+
+    return {
+      setLayout(nextLayout: DesktopCompactLayoutForTest) {
+        desktopWindow.__nekoDesktopCompactLayout = nextLayout;
+      },
+      get layout() {
+        return desktopWindow.__nekoDesktopCompactLayout;
+      },
+      restore() {
+        desktopWindow.__nekoDesktopCompactLayout = originalDesktopLayout;
+        window.matchMedia = originalMatchMedia;
+        Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+        Object.defineProperty(window, 'innerHeight', { configurable: true, value: originalInnerHeight });
+      },
+    };
   };
 
   const renderInputApp = (
@@ -4693,6 +4757,119 @@ describe('App', () => {
     }
   });
 
+  it('uses viewport-fit compact tool wheel layout on desktop when the surface is near the taskbar', () => {
+    const desktopLayout = installDesktopCompactLayout({
+      windowBounds: { x: 0, y: 470, width: 700, height: 330 },
+      workArea: { x: 0, y: 0, width: 1000, height: 800 },
+    }, { width: 700, height: 330 });
+
+    try {
+      const { container } = render(<App chatSurfaceMode="compact" compactChatState="input" />);
+      const fan = container.querySelector('.compact-input-tool-fan') as HTMLDivElement;
+      vi.spyOn(fan, 'getBoundingClientRect').mockReturnValue({
+        left: 373,
+        top: 165,
+        right: 605,
+        bottom: 397,
+        width: 232,
+        height: 232,
+        x: 373,
+        y: 165,
+        toJSON: () => ({}),
+      });
+
+      const actionButton = container.querySelector('.compact-input-tool-toggle') as HTMLButtonElement;
+      expect(actionButton).not.toBeNull();
+      fireEvent.click(actionButton);
+
+      expect(fan).toHaveAttribute('data-compact-input-tool-fan-open', 'true');
+      expect(fan).toHaveAttribute('data-compact-tool-wheel-layout', 'viewport-fit');
+    } finally {
+      desktopLayout.restore();
+    }
+  });
+
+  it('uses viewport-fit from desktop screen bottom distance before the compact carrier expands', async () => {
+    const desktopLayout = installDesktopCompactLayout({
+      windowBounds: { x: 100, y: 720, width: 430, height: 56 },
+      workArea: { x: 0, y: 0, width: 1000, height: 800 },
+    }, { width: 430, height: 56 });
+
+    try {
+      const { container } = render(<App chatSurfaceMode="compact" compactChatState="input" />);
+      const fan = container.querySelector('.compact-input-tool-fan') as HTMLDivElement;
+      vi.spyOn(fan, 'getBoundingClientRect').mockImplementation(() => {
+        const expanded = (desktopLayout.layout?.windowBounds?.height ?? 0) > 100;
+        const left = expanded ? 373 : 303;
+        const top = expanded ? 165 : 0;
+        return {
+          left,
+          top,
+          right: left + 232,
+          bottom: top + 232,
+          width: 232,
+          height: 232,
+          x: left,
+          y: top,
+          toJSON: () => ({}),
+        } as DOMRect;
+      });
+
+      const actionButton = container.querySelector('.compact-input-tool-toggle') as HTMLButtonElement;
+      expect(actionButton).not.toBeNull();
+      fireEvent.click(actionButton);
+      expect(fan).toHaveAttribute('data-compact-tool-wheel-layout', 'viewport-fit');
+
+      desktopLayout.setLayout({
+        windowBounds: { x: 0, y: 470, width: 700, height: 330 },
+        workArea: { x: 0, y: 0, width: 1000, height: 800 },
+      });
+      act(() => {
+        window.dispatchEvent(new CustomEvent('neko:desktop-compact-layout-change', {
+          detail: desktopLayout.layout,
+        }));
+      });
+
+      await waitFor(() => {
+        expect(fan).toHaveAttribute('data-compact-tool-wheel-layout', 'viewport-fit');
+      });
+    } finally {
+      desktopLayout.restore();
+    }
+  });
+
+  it('keeps the default compact tool wheel layout when the desktop bottom reverse arc would clip at a side edge', () => {
+    const desktopLayout = installDesktopCompactLayout({
+      windowBounds: { x: 0, y: 720, width: 430, height: 56 },
+      workArea: { x: 0, y: 0, width: 140, height: 800 },
+    }, { width: 430, height: 56 });
+
+    try {
+      const { container } = render(<App chatSurfaceMode="compact" compactChatState="input" />);
+      const fan = container.querySelector('.compact-input-tool-fan') as HTMLDivElement;
+      vi.spyOn(fan, 'getBoundingClientRect').mockReturnValue({
+        left: 10,
+        top: 0,
+        right: 242,
+        bottom: 232,
+        width: 232,
+        height: 232,
+        x: 10,
+        y: 0,
+        toJSON: () => ({}),
+      });
+
+      const actionButton = container.querySelector('.compact-input-tool-toggle') as HTMLButtonElement;
+      expect(actionButton).not.toBeNull();
+      fireEvent.click(actionButton);
+
+      expect(fan).toHaveAttribute('data-compact-input-tool-fan-open', 'true');
+      expect(fan).toHaveAttribute('data-compact-tool-wheel-layout', 'default');
+    } finally {
+      desktopLayout.restore();
+    }
+  });
+
   it('uses the visual viewport when checking compact tool wheel clipping on mobile', () => {
     const originalMatchMedia = window.matchMedia;
     const originalInnerWidth = window.innerWidth;
@@ -5905,6 +6082,110 @@ describe('App', () => {
     } finally {
       fanRectSpy.mockRestore();
     }
+  });
+
+  it('keeps compact tool wheel rotation visually consistent in viewport-fit layout', () => {
+    const desktopLayout = installDesktopCompactLayout({
+      windowBounds: { x: 100, y: 720, width: 430, height: 56 },
+      workArea: { x: 0, y: 0, width: 1000, height: 800 },
+    }, { width: 430, height: 56 });
+
+    try {
+      render(
+        <App
+          chatSurfaceMode="compact"
+          compactChatState="input"
+        />,
+      );
+
+      const actionButton = document.body.querySelector('.compact-input-tool-toggle') as HTMLButtonElement;
+      expect(actionButton).not.toBeNull();
+      const fan = document.body.querySelector('.compact-input-tool-fan') as HTMLDivElement;
+      const fanRectSpy = mockCompactToolFanRect(fan);
+      fireEvent.click(actionButton);
+
+      try {
+        expect(fan).toHaveAttribute('data-compact-tool-wheel-layout', 'viewport-fit');
+        expect(fan.querySelector('[data-compact-tool-wheel-slot="0"]')).toHaveClass('compact-input-tool-item-screenshot');
+
+        fireEvent.wheel(fan, { deltaY: 80 });
+
+        expect(fan.querySelector('.compact-input-tool-item-screenshot')).toHaveAttribute('data-compact-tool-wheel-slot', '1');
+        expect(fan.querySelector('[data-compact-tool-wheel-slot="0"]')).toHaveClass('compact-input-tool-item-galgame');
+      } finally {
+        fanRectSpy.mockRestore();
+      }
+    } finally {
+      desktopLayout.restore();
+    }
+  });
+
+  it('uses visual charge direction in viewport-fit compact tool wheel layout', () => {
+    const desktopLayout = installDesktopCompactLayout({
+      windowBounds: { x: 100, y: 720, width: 430, height: 56 },
+      workArea: { x: 0, y: 0, width: 1000, height: 800 },
+    }, { width: 430, height: 56 });
+
+    try {
+      render(
+        <App
+          chatSurfaceMode="compact"
+          compactChatState="input"
+        />,
+      );
+
+      const actionButton = document.body.querySelector('.compact-input-tool-toggle') as HTMLButtonElement;
+      expect(actionButton).not.toBeNull();
+      const fan = document.body.querySelector('.compact-input-tool-fan') as HTMLDivElement;
+      const fanRectSpy = mockCompactToolFanRect(fan);
+      fireEvent.click(actionButton);
+
+      try {
+        expect(fan).toHaveAttribute('data-compact-tool-wheel-layout', 'viewport-fit');
+        fireEvent.pointerDown(fan, {
+          pointerId: 86,
+          ...compactToolWheelPoint(0),
+          button: 0,
+          buttons: 1,
+          pointerType: 'mouse',
+        });
+        for (let index = 1; index <= 28; index += 1) {
+          fireEvent.pointerMove(fan, {
+            pointerId: 86,
+            ...compactToolWheelPoint(index * 0.7),
+            buttons: 1,
+            pointerType: 'mouse',
+          });
+        }
+
+        expect(fan).toHaveAttribute('data-compact-tool-wheel-charge-active', 'true');
+        expect(fan).toHaveAttribute('data-compact-tool-wheel-charge-direction', 'forward');
+        fireEvent.pointerUp(fan, {
+          pointerId: 86,
+          ...compactToolWheelPoint(28 * 0.7),
+          buttons: 0,
+          pointerType: 'mouse',
+        });
+      } finally {
+        fanRectSpy.mockRestore();
+      }
+    } finally {
+      desktopLayout.restore();
+    }
+  });
+
+  it('keeps viewport-fit hidden compact tool wheel slots on the reversed arc', () => {
+    const compactChatStyles = readCompactChatStylesForTest();
+
+    expect(compactChatStyles).toMatch(
+      /\[data-compact-tool-wheel-layout="viewport-fit"\]\s+\.compact-input-tool-item\[data-compact-tool-wheel-slot="hidden-backward"\][\s\S]*?\{\s*transform:[^}]*-230deg/s,
+    );
+    expect(compactChatStyles).toMatch(
+      /\[data-compact-tool-wheel-layout="viewport-fit"\]\s+\.compact-input-tool-item\[data-compact-tool-wheel-slot="hidden-forward"\][\s\S]*?\{\s*transform:[^}]*-50deg/s,
+    );
+    expect(compactChatStyles).toMatch(
+      /\[data-compact-tool-wheel-layout="viewport-fit"\]\s+\.compact-input-tool-item\[data-compact-tool-wheel-slot="hidden"[\s\S]*?transition: none;/s,
+    );
   });
 
   it('retargets compact tool hover to the visual button under the pointer after wheel rotation', async () => {
